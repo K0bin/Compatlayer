@@ -1,9 +1,10 @@
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, CStr, c_void};
 use std::sync::OnceLock;
 use ash::vk;
-use crate::LockedMap;
+use crate::{find_in_p_next_chain, LockedMap};
 use crate::instance::{instances, physical_devices};
 use crate::loader::{VkLayerDeviceCreateInfo, VkLayerFunction};
+use crate::pnext::clone_pnext;
 
 pub struct DeviceData {
     device: ash::Device,
@@ -92,6 +93,40 @@ pub unsafe extern "system" fn create_device(
     };
     let instance = instance_data.instance();
 
+    let old_create_info = unsafe { p_create_info.as_ref().unwrap() };
+    let mut new_create_info = old_create_info.clone();
+    let supported_features = unsafe { instance.get_physical_device_features(physical_device) };
+
+    let bump = bumpalo::Bump::new();
+    let mut new_enabled_features: vk::PhysicalDeviceFeatures;
+    let mut new_enabled_features_2: vk::PhysicalDeviceFeatures2 = vk::PhysicalDeviceFeatures2::default();
+    let features_2: *const vk::PhysicalDeviceFeatures2 = unsafe { find_in_p_next_chain(old_create_info.p_next, vk::StructureType::PHYSICAL_DEVICE_FEATURES_2, |_| true) };
+    if !features_2.is_null() || !old_create_info.p_enabled_features.is_null() {
+        new_enabled_features = if !features_2.is_null() {
+            unsafe { (*features_2).features.clone() }
+        } else {
+            unsafe { (*old_create_info.p_enabled_features).clone() }
+        };
+        // Hide our faked features from the lower layers & driver
+        new_enabled_features.depth_bounds &= supported_features.depth_bounds;
+        new_enabled_features.geometry_shader &= supported_features.geometry_shader;
+
+        if !features_2.is_null() {
+            new_enabled_features_2.features = new_enabled_features;
+            new_create_info.p_enabled_features = &new_enabled_features as *const vk::PhysicalDeviceFeatures;
+            let new_p_next = clone_pnext(old_create_info.p_next,
+                                         &bump,
+                                         |s| s != vk::StructureType::PHYSICAL_DEVICE_FEATURES_2
+            );
+            if let Some(new_p_next) = new_p_next {
+                new_enabled_features_2.p_next = new_p_next as *mut vk::BaseOutStructure<'_> as *mut c_void;
+            }
+            new_create_info.p_next = &new_enabled_features_2 as *const vk::PhysicalDeviceFeatures2 as *const c_void;
+        } else {
+            new_create_info.p_enabled_features = &new_enabled_features as *const vk::PhysicalDeviceFeatures;
+        }
+    }
+
     let next_create = unsafe {
         let Some(next_create) = get_instance_proc_addr(instance.handle(), c"vkCreateDevice".as_ptr()) else {
             log::error!("next layer has no vkCreateDevice");
@@ -101,7 +136,7 @@ pub unsafe extern "system" fn create_device(
     };
     let res = unsafe {
         let next_create: vk::PFN_vkCreateDevice = std::mem::transmute(next_create);
-        next_create(physical_device, p_create_info, p_allocator, p_device)
+        next_create(physical_device, &new_create_info as *const vk::DeviceCreateInfo, p_allocator, p_device)
     };
     if res != vk::Result::SUCCESS {
         log::warn!("next layer failed with {res:?}");

@@ -60,6 +60,9 @@ pub unsafe extern "system" fn get_instance_proc_addr(
             b"vkDestroyInstance" => pfn!(destroy_instance as vk::PFN_vkDestroyInstance),
             b"vkCreateDevice" => pfn!(crate::create_device as vk::PFN_vkCreateDevice),
             b"vkEnumeratePhysicalDevices" => pfn!(enumerate_physical_devices as vk::PFN_vkEnumeratePhysicalDevices),
+            b"vkGetPhysicalDeviceFeatures" => pfn!(get_physical_device_features as vk::PFN_vkGetPhysicalDeviceFeatures),
+            b"vkGetPhysicalDeviceFeatures2" => pfn!(get_physical_device_features2 as vk::PFN_vkGetPhysicalDeviceFeatures2),
+            b"vkGetPhysicalDeviceFeatures2KHR" => pfn!(get_physical_device_features2 as vk::PFN_vkGetPhysicalDeviceFeatures2),
             _ => None,
         }
     };
@@ -196,4 +199,82 @@ pub unsafe extern "system" fn destroy_instance(
         log::info!("vkDestroyInstance {instance_handle:?}");
         unsafe { (instance_data.instance().fp_v1_0().destroy_instance)(instance_handle, p_allocator); }
     }
+}
+
+fn modify_base_features(instance_data: &InstanceData, features: &mut vk::PhysicalDeviceFeatures) {
+    features.geometry_shader = vk::TRUE;
+
+    if instance_data.engine_name == "idTech" {
+        log::info!("Faking depth bounds for idTech.");
+        features.depth_bounds = vk::TRUE;
+    }
+    if instance_data.engine_name == "DXVK" {
+        log::info!("Faking fillModeNonSolid for DXVK.");
+        features.fill_mode_non_solid = vk::TRUE;
+
+        if instance_data.app_version & 1 == 1 {
+            log::info!("Faking geometry shaders for DXVK D3D9.");
+            features.geometry_shader = vk::TRUE;
+        }
+    }
+}
+
+pub unsafe extern "system" fn get_physical_device_features(
+    physical_device_handle: vk::PhysicalDevice,
+    features: *mut vk::PhysicalDeviceFeatures
+) {
+    if features.is_null() {
+        return;
+    }
+    let Ok(physical_devices_guard) = physical_devices().lock() else {
+        log::error!("Could not lock physical devices");
+        return;
+    };
+    let Some(physical_device_data) = physical_devices_guard.get(&physical_device_handle) else {
+        log::error!("Could not find physical device");
+        return;
+    };
+
+    let Ok(instances_guard) = instances().lock() else {
+        log::error!("Could not lock instances");
+        return;
+    };
+    let Some(instance_data) = instances_guard.get(&physical_device_data.instance_handle) else {
+        log::error!("Could not find instance");
+        return;
+    };
+
+    unsafe { (instance_data.instance.fp_v1_0().get_physical_device_features)(physical_device_handle, features); }
+    let features_mut = unsafe { &mut (*features) };
+    modify_base_features(instance_data, features_mut);
+}
+
+pub unsafe extern "system" fn get_physical_device_features2(
+    physical_device_handle: vk::PhysicalDevice,
+    features: *mut vk::PhysicalDeviceFeatures2
+) {
+    if features.is_null() {
+        return;
+    }
+    let Ok(physical_devices_guard) = physical_devices().lock() else {
+        log::error!("Could not lock physical devices");
+        return;
+    };
+    let Some(physical_device_data) = physical_devices_guard.get(&physical_device_handle) else {
+        log::error!("Could not find physical device");
+        return;
+    };
+
+    let Ok(instances_guard) = instances().lock() else {
+        log::error!("Could not lock instances");
+        return;
+    };
+    let Some(instance_data) = instances_guard.get(&physical_device_data.instance_handle) else {
+        log::error!("Could not find instance");
+        return;
+    };
+
+    unsafe { (instance_data.instance.fp_v1_1().get_physical_device_features2)(physical_device_handle, features); }
+    let features_mut = unsafe { &mut (*features).features };
+    modify_base_features(instance_data, features_mut);
 }
