@@ -1,6 +1,7 @@
 use std::ffi::{c_char, CStr, c_void};
 use std::sync::OnceLock;
 use ash::vk;
+use ash::vk::Handle;
 use crate::{find_in_p_next_chain, LockedMap};
 use crate::instance::{instances, physical_devices};
 use crate::loader::{VkLayerDeviceCreateInfo, VkLayerFunction};
@@ -8,7 +9,10 @@ use crate::pnext::clone_pnext;
 
 pub struct DeviceData {
     device: ash::Device,
+    extended_dynamic_state: Option<ash::ext::extended_dynamic_state::Device>,
     get_proc_addr: vk::PFN_vkGetDeviceProcAddr,
+    supported_features: vk::PhysicalDeviceFeatures,
+    enabled_extensions: Vec<String>,
 }
 
 pub fn devices() -> &'static LockedMap<vk::Device, DeviceData> {
@@ -16,11 +20,29 @@ pub fn devices() -> &'static LockedMap<vk::Device, DeviceData> {
     M.get_or_init(Default::default)
 }
 
+pub struct CommandBufferData {
+    device_handle: vk::Device,
+    cmd_pool: vk::CommandPool,
+}
+
+pub fn cmd_buffers() -> &'static LockedMap<vk::CommandBuffer, crate::CommandBufferData> {
+    static M: OnceLock<LockedMap<vk::CommandBuffer, crate::CommandBufferData>> = OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+
 pub unsafe fn device_proc_by_name(name: &[u8]) -> vk::PFN_vkVoidFunction {
     unsafe {
         match name {
             b"vkGetDeviceProcAddr" => crate::pfn!(get_device_proc_addr as vk::PFN_vkGetDeviceProcAddr),
             b"vkDestroyDevice" => crate::pfn!(destroy_device as vk::PFN_vkDestroyDevice),
+            b"vkCmdSetDepthBoundsTestEnable" => crate::pfn!(cmd_set_depth_bounds_test_enable::<false> as vk::PFN_vkCmdSetDepthBoundsTestEnable),
+            b"vkCmdSetDepthBoundsTestEnableEXT" => crate::pfn!(cmd_set_depth_bounds_test_enable::<true> as vk::PFN_vkCmdSetDepthBoundsTestEnable),
+            b"vkDestroyCommandPool" => crate::pfn!(destroy_command_pool as vk::PFN_vkDestroyCommandPool),
+            b"vkResetCommandPool" => crate::pfn!(reset_command_pool as vk::PFN_vkResetCommandPool),
+            b"vkAllocateCommandBuffers" => crate::pfn!(allocate_command_buffer as vk::PFN_vkAllocateCommandBuffers),
+            b"vkFreeCommandBuffers" => crate::pfn!(free_command_buffers as vk::PFN_vkFreeCommandBuffers),
+            b"vkCreateGraphicsPipelines" => crate::pfn!(create_graphics_pipelines as vk::PFN_vkCreateGraphicsPipelines),
             _ => None,
         }
     }
@@ -127,6 +149,9 @@ pub unsafe extern "system" fn create_device(
         }
     }
 
+    let enabled_extensions = unsafe { std::slice::from_raw_parts(old_create_info.pp_enabled_extension_names, old_create_info.enabled_extension_count as usize) };
+    let enabled_extensions_strs: Vec<String> = unsafe { enabled_extensions.iter().map(|s| std::ffi::CStr::from_ptr(*s).to_string_lossy().to_string()) }.collect();
+
     let next_create = unsafe {
         let Some(next_create) = get_instance_proc_addr(instance.handle(), c"vkCreateDevice".as_ptr()) else {
             log::error!("next layer has no vkCreateDevice");
@@ -150,9 +175,18 @@ pub unsafe extern "system" fn create_device(
         (device_handle, device)
     };
 
+    let extended_dynamic_state = if enabled_extensions_strs.iter().any(|s| s == "VK_EXT_extended_dynamic_state") {
+        Some(ash::ext::extended_dynamic_state::Device::load(instance, &device))
+    } else {
+        None
+    };
+
     let data = DeviceData {
         device,
         get_proc_addr: get_device_proc_addr,
+        supported_features,
+        enabled_extensions: enabled_extensions_strs,
+        extended_dynamic_state,
     };
 
     devices().lock().unwrap().insert(device_handle, data);
@@ -175,4 +209,200 @@ pub unsafe extern "system" fn destroy_device(
         log::info!("vkDestroyDevice {device_handle:?}");
         unsafe { (device_data.device.fp_v1_0().destroy_device)(device_handle, p_allocator); }
     }
+}
+
+
+pub unsafe extern "system" fn allocate_command_buffer(
+    device_handle: vk::Device,
+    p_command_buffer_allocate_info: *const vk::CommandBufferAllocateInfo,
+    p_command_buffers: *mut vk::CommandBuffer
+) -> vk::Result {
+    if device_handle == vk::Device::null() || p_command_buffer_allocate_info.is_null() {
+        return vk::Result::ERROR_UNKNOWN;
+    }
+    let Ok(devices_guard) = devices().lock() else {
+        log::error!("Could not lock devices");
+        return vk::Result::ERROR_UNKNOWN;
+    };
+    let Some(device_data) = devices_guard.get(&device_handle) else {
+        log::error!("Could not find device in map");
+        return vk::Result::ERROR_UNKNOWN;
+    };
+    let res = unsafe { (device_data.device.fp_v1_0().allocate_command_buffers)(device_handle, p_command_buffer_allocate_info, p_command_buffers) };
+    if res != vk::Result::SUCCESS {
+        return res;
+    }
+    let Ok(mut cmd_buffers_guards) = cmd_buffers().lock() else {
+        log::error!("Could not lock devices");
+        return vk::Result::ERROR_UNKNOWN;
+    };
+    let cmd_buffers = unsafe { std::slice::from_raw_parts_mut(p_command_buffers, (*p_command_buffer_allocate_info).command_buffer_count as usize) };
+    for cmd_buffer in cmd_buffers {
+        cmd_buffers_guards.insert(*cmd_buffer, CommandBufferData {
+            device_handle,
+            cmd_pool: unsafe { (*p_command_buffer_allocate_info).command_pool }
+        });
+    }
+
+    res
+}
+
+pub unsafe extern "system" fn free_command_buffers(
+    device_handle: vk::Device,
+    command_pool: vk::CommandPool,
+    command_buffer_count: u32,
+    p_command_buffers: *const vk::CommandBuffer,
+) {
+    if device_handle == vk::Device::null() {
+        return;
+    }
+    let Ok(devices_guard) = devices().lock() else {
+        log::error!("Could not lock devices");
+        return;
+    };
+    let Some(device_data) = devices_guard.get(&device_handle) else {
+        log::error!("Could not find device in map");
+        return;
+    };
+
+    let Ok(mut cmd_buffers_guards) = cmd_buffers().lock() else {
+        log::error!("Could not lock devices");
+        return;
+    };
+    cmd_buffers_guards.retain(|_, cmd_buffer| cmd_buffer.cmd_pool == command_pool);
+    unsafe { (device_data.device.fp_v1_0().free_command_buffers)(device_handle, command_pool, command_buffer_count, p_command_buffers) };
+}
+
+pub unsafe extern "system" fn reset_command_pool(
+    device_handle: vk::Device,
+    command_pool: vk::CommandPool,
+    flags: vk::CommandPoolResetFlags,
+) -> vk::Result {
+    if device_handle == vk::Device::null() {
+        return vk::Result::ERROR_UNKNOWN;
+    }
+    let Ok(devices_guard) = devices().lock() else {
+        log::error!("Could not lock devices");
+        return vk::Result::ERROR_UNKNOWN;
+    };
+    let Some(device_data) = devices_guard.get(&device_handle) else {
+        log::error!("Could not find device in map");
+        return vk::Result::ERROR_UNKNOWN;
+    };
+    let Ok(mut cmd_buffers_guards) = cmd_buffers().lock() else {
+        log::error!("Could not lock devices");
+        return vk::Result::ERROR_UNKNOWN;
+    };
+    cmd_buffers_guards.retain(|_, cmd_buffer| cmd_buffer.cmd_pool == command_pool);
+    unsafe { (device_data.device.fp_v1_0().reset_command_pool)(device_handle, command_pool, flags) }
+}
+
+pub unsafe extern "system" fn destroy_command_pool(
+    device_handle: vk::Device,
+    command_pool: vk::CommandPool,
+    p_allocator: *const vk::AllocationCallbacks,
+) {
+    if device_handle == vk::Device::null() {
+        return;
+    }
+    let Ok(devices_guard) = devices().lock() else {
+        log::error!("Could not lock devices");
+        return;
+    };
+    let Some(device_data) = devices_guard.get(&device_handle) else {
+        log::error!("Could not find device in map");
+        return;
+    };
+
+    let Ok(mut cmd_buffers_guards) = cmd_buffers().lock() else {
+        log::error!("Could not lock devices");
+        return;
+    };
+    cmd_buffers_guards.retain(|_, cmd_buffer| cmd_buffer.cmd_pool == command_pool);
+    unsafe { (device_data.device.fp_v1_0().destroy_command_pool)(device_handle, command_pool, p_allocator); }
+}
+
+pub unsafe extern "system" fn cmd_set_depth_bounds_test_enable<const EXT: bool>(
+    command_buffer_handle: vk::CommandBuffer,
+    enabled: vk::Bool32,
+) {
+    if command_buffer_handle == vk::CommandBuffer::null() {
+        return;
+    }
+    let Ok(cmd_buffers_guards) = cmd_buffers().lock() else {
+        log::error!("Could not lock devices");
+        return;
+    };
+    let Some(cmd_buffer_data) = cmd_buffers_guards.get(&command_buffer_handle) else {
+        log::error!("Could not find command buffer in map");
+        return;
+    };
+    let Ok(devices_guard) = devices().lock() else {
+        log::error!("Could not lock devices");
+        return;
+    };
+    let Some(device_data) = devices_guard.get(&cmd_buffer_data.device_handle) else {
+        log::error!("Could not find device in map");
+        return;
+    };
+    if device_data.supported_features.depth_bounds == vk::FALSE {
+        return;
+    }
+
+
+    if EXT {
+        let Some(ext_device) = device_data.extended_dynamic_state.as_ref() else {
+            log::error!("VK_EXT_extended_dynamic_state was not loaded.");
+            return;
+        };
+        unsafe { (ext_device.fp().cmd_set_depth_bounds_test_enable_ext)(command_buffer_handle, enabled) }
+    } else {
+        unsafe { (device_data.device.fp_v1_3().cmd_set_depth_bounds_test_enable)(command_buffer_handle, enabled) }
+    }
+}
+
+pub unsafe extern "system" fn create_graphics_pipelines(
+    device_handle: vk::Device,
+    pipeline_cache: vk::PipelineCache,
+    create_info_count: u32,
+    create_infos: *const vk::GraphicsPipelineCreateInfo,
+    allocator: *const vk::AllocationCallbacks,
+    pipelines: *mut vk::Pipeline,
+) -> vk::Result {
+    if device_handle.is_null() {
+        return vk::Result::ERROR_UNKNOWN;
+    }
+    let Ok(devices_guard) = devices().lock() else {
+        log::error!("Could not lock devices");
+        return vk::Result::ERROR_UNKNOWN;
+    };
+    let Some(device_data) = devices_guard.get(&device_handle) else {
+        log::error!("Could not find device in map");
+        return vk::Result::ERROR_UNKNOWN;
+    };
+
+    if device_data.supported_features.depth_bounds == vk::TRUE || create_infos.is_null() || create_info_count == 0 {
+        unsafe { return (device_data.device.fp_v1_0().create_graphics_pipelines)(device_handle, pipeline_cache, create_info_count, create_infos, allocator, pipelines) };
+    }
+
+    let create_infos = unsafe { std::slice::from_raw_parts(create_infos, create_info_count as usize) };
+
+    let depth_stencil_infos: Vec<Option<vk::PipelineDepthStencilStateCreateInfo>> =
+        create_infos.iter().map(|info| unsafe {
+            info.p_depth_stencil_state.as_ref().map(|ds| vk::PipelineDepthStencilStateCreateInfo {
+                depth_bounds_test_enable: vk::FALSE,
+                ..ds.clone()
+            })
+        }).collect();
+
+    let mut new_infos = Vec::<vk::GraphicsPipelineCreateInfo>::with_capacity(create_infos.len());
+    for (info, ds) in create_infos.iter().zip(depth_stencil_infos.iter()) {
+        let mut new_info = info.clone();
+        if let Some(ds) = ds {
+            new_info.p_depth_stencil_state = ds;
+        }
+        new_infos.push(new_info);
+    }
+
+    unsafe { (device_data.device.fp_v1_0().create_graphics_pipelines)(device_handle, pipeline_cache, create_info_count, new_infos.as_ptr(), allocator, pipelines) }
 }
