@@ -3,15 +3,16 @@
 mod loader;
 mod device;
 mod instance;
+mod pnext;
 
 use ash::vk;
 use loader::*;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::sync::{Mutex, Once};
 
 use instance::*;
 use device::*;
+use pnext::*;
 
 // Logging
 
@@ -32,20 +33,6 @@ fn init_logging() {
 
 type LockedMap< K, T> = Mutex<HashMap<K, T>>;
 
-pub unsafe fn find_in_p_next_chain<T>(mut p_next: *const c_void, s_type: vk::StructureType, callback: fn(&T) -> bool) -> *const T {
-    while !p_next.is_null() {
-        let base = unsafe { &*(p_next as *const vk::BaseInStructure) };
-        if base.s_type == s_type {
-            let typed_ptr = p_next as *const T;
-            let typed_ref = unsafe { typed_ptr.as_ref().unwrap() };
-            if callback(typed_ref) {
-                return typed_ptr;
-            }
-        }
-        p_next = base.p_next as *const c_void;
-    }
-    std::ptr::null()
-}
 
 macro_rules! pfn {
     ($f:expr) => {

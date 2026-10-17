@@ -13,6 +13,7 @@ bench = false
 log = "0.4"
 env_logger = "0.11"
 ash = { git = "https://github.com/ash-rs/ash" }
+bumpalo = "3.20"
 
 [build-dependencies]
 toml = "1.1"
