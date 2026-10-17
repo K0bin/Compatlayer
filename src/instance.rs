@@ -202,8 +202,6 @@ pub unsafe extern "system" fn destroy_instance(
 }
 
 fn modify_base_features(instance_data: &InstanceData, features: &mut vk::PhysicalDeviceFeatures) {
-    features.geometry_shader = vk::TRUE;
-
     if instance_data.engine_name == "idTech" {
         log::info!("Faking depth bounds for idTech.");
         features.depth_bounds = vk::TRUE;
