@@ -2,9 +2,10 @@
 name = "compatlayer"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [lib]
-name = "libVkLayer_Compat"
+name = "VkLayer_compat"
 crate-type = ["cdylib"]
 bench = false
 
@@ -12,3 +13,6 @@ bench = false
 log = "0.4"
 env_logger = "0.11"
 ash = { git = "https://github.com/ash-rs/ash" }
+
+[build-dependencies]
+toml = "1.1"
