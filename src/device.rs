@@ -8,7 +8,9 @@ use crate::loader::{VkLayerDeviceCreateInfo, VkLayerFunction};
 
 pub struct DeviceData {
     device: ash::Device,
-    extended_dynamic_state: Option<ash::ext::extended_dynamic_state::Device>,
+    extended_dynamic_state: Option<ash::ext::extended_dynamic_state::DeviceFn>,
+    extended_dynamic_state2: Option<ash::ext::extended_dynamic_state2::DeviceFn>,
+    extended_dynamic_state3: Option<ash::ext::extended_dynamic_state3::DeviceFn>,
     get_proc_addr: vk::PFN_vkGetDeviceProcAddr,
     supported_features: vk::PhysicalDeviceFeatures,
     enabled_extensions: Vec<String>,
@@ -42,6 +44,7 @@ pub unsafe fn device_proc_by_name(name: &[u8]) -> vk::PFN_vkVoidFunction {
             b"vkAllocateCommandBuffers" => crate::pfn!(allocate_command_buffer as vk::PFN_vkAllocateCommandBuffers),
             b"vkFreeCommandBuffers" => crate::pfn!(free_command_buffers as vk::PFN_vkFreeCommandBuffers),
             b"vkCreateGraphicsPipelines" => crate::pfn!(create_graphics_pipelines as vk::PFN_vkCreateGraphicsPipelines),
+            b"vkCmdSetPolygonModeEXT" => crate::pfn!(cmd_set_polygon_mode as vk::PFN_vkCmdSetPolygonModeEXT),
             _ => None,
         }
     }
@@ -132,6 +135,7 @@ pub unsafe extern "system" fn create_device(
         // Hide our faked features from the lower layers & driver
         new_enabled_features.depth_bounds &= supported_features.depth_bounds;
         new_enabled_features.geometry_shader &= supported_features.geometry_shader;
+        new_enabled_features.fill_mode_non_solid &= supported_features.fill_mode_non_solid;
 
         if !features_2.is_null() {
             new_enabled_features_2.features = new_enabled_features;
@@ -176,11 +180,20 @@ pub unsafe extern "system" fn create_device(
         (device_handle, device)
     };
 
-    let extended_dynamic_state = if enabled_extensions_strs.iter().any(|s| s == "VK_EXT_extended_dynamic_state") {
-        Some(ash::ext::extended_dynamic_state::Device::load(instance, &device))
-    } else {
-        None
-    };
+    let supported_extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }.unwrap_or_default();
+
+    let extended_dynamic_state = (enabled_extensions_strs.iter().any(|s| s == "VK_EXT_extended_dynamic_state")
+        && supported_extensions.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }.to_bytes() == b"VK_EXT_extended_dynamic_state")).then(|| {
+        ash::ext::extended_dynamic_state::DeviceFn::load(|name| unsafe { std::mem::transmute(get_device_proc_addr(device_handle, name.as_ptr())) })
+    });
+    let extended_dynamic_state2 = (enabled_extensions_strs.iter().any(|s| s == "VK_EXT_extended_dynamic_state2")
+        && supported_extensions.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }.to_bytes() == b"VK_EXT_extended_dynamic_state2")).then(|| {
+        ash::ext::extended_dynamic_state2::DeviceFn::load(|name| unsafe { std::mem::transmute(get_device_proc_addr(device_handle, name.as_ptr())) })
+    });
+    let extended_dynamic_state3 = (enabled_extensions_strs.iter().any(|s| s == "VK_EXT_extended_dynamic_state3")
+        && supported_extensions.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }.to_bytes() == b"VK_EXT_extended_dynamic_state3")).then(|| {
+        ash::ext::extended_dynamic_state3::DeviceFn::load(|name| unsafe { std::mem::transmute(get_device_proc_addr(device_handle, name.as_ptr())) })
+    });
 
     let data = DeviceData {
         device,
@@ -188,6 +201,8 @@ pub unsafe extern "system" fn create_device(
         supported_features,
         enabled_extensions: enabled_extensions_strs,
         extended_dynamic_state,
+        extended_dynamic_state2,
+        extended_dynamic_state3,
     };
 
     devices().lock().unwrap().insert(device_handle, data);
@@ -350,13 +365,12 @@ pub unsafe extern "system" fn cmd_set_depth_bounds_test_enable<const EXT: bool>(
         return;
     }
 
-
     if EXT {
         let Some(ext_device) = device_data.extended_dynamic_state.as_ref() else {
             log::error!("VK_EXT_extended_dynamic_state was not loaded.");
             return;
         };
-        unsafe { (ext_device.fp().cmd_set_depth_bounds_test_enable_ext)(command_buffer_handle, enabled) }
+        unsafe { (ext_device.cmd_set_depth_bounds_test_enable_ext)(command_buffer_handle, enabled) }
     } else {
         unsafe { (device_data.device.fp_v1_3().cmd_set_depth_bounds_test_enable)(command_buffer_handle, enabled) }
     }
@@ -382,8 +396,8 @@ pub unsafe extern "system" fn create_graphics_pipelines(
         return vk::Result::ERROR_UNKNOWN;
     };
 
-    if device_data.supported_features.depth_bounds == vk::TRUE || create_infos.is_null() || create_info_count == 0 {
-        unsafe { return (device_data.device.fp_v1_0().create_graphics_pipelines)(device_handle, pipeline_cache, create_info_count, create_infos, allocator, pipelines) };
+    if create_infos.is_null() || create_info_count == 0 {
+        return unsafe { (device_data.device.fp_v1_0().create_graphics_pipelines)(device_handle, pipeline_cache, create_info_count, create_infos, allocator, pipelines) };
     }
 
     let create_infos = unsafe { std::slice::from_raw_parts(create_infos, create_info_count as usize) };
@@ -391,19 +405,61 @@ pub unsafe extern "system" fn create_graphics_pipelines(
     let depth_stencil_infos: Vec<Option<vk::PipelineDepthStencilStateCreateInfo>> =
         create_infos.iter().map(|info| unsafe {
             info.p_depth_stencil_state.as_ref().map(|ds| vk::PipelineDepthStencilStateCreateInfo {
-                depth_bounds_test_enable: vk::FALSE,
+                depth_bounds_test_enable: ds.depth_bounds_test_enable & device_data.supported_features.depth_bounds,
                 ..ds.clone()
             })
         }).collect();
 
+    let rasterizer_infos: Vec<Option<vk::PipelineRasterizationStateCreateInfo>> =
+        create_infos.iter().map(|info| unsafe {
+            info.p_rasterization_state.as_ref().map(|rs| vk::PipelineRasterizationStateCreateInfo {
+                polygon_mode: if device_data.supported_features.fill_mode_non_solid == vk::TRUE { rs.polygon_mode } else { vk::PolygonMode::FILL },
+                ..rs.clone()
+            })
+        }).collect();
+
     let mut new_infos = Vec::<vk::GraphicsPipelineCreateInfo>::with_capacity(create_infos.len());
-    for (info, ds) in create_infos.iter().zip(depth_stencil_infos.iter()) {
+    for ((info, ds), rs) in create_infos.iter().zip(depth_stencil_infos.iter()).zip(rasterizer_infos.iter()) {
         let mut new_info = info.clone();
         if let Some(ds) = ds {
             new_info.p_depth_stencil_state = ds;
+        }
+        if let Some(rs) = rs {
+            new_info.p_rasterization_state = rs;
         }
         new_infos.push(new_info);
     }
 
     unsafe { (device_data.device.fp_v1_0().create_graphics_pipelines)(device_handle, pipeline_cache, create_info_count, new_infos.as_ptr(), allocator, pipelines) }
+}
+
+pub unsafe extern "system" fn cmd_set_polygon_mode(cmd_buffer_handle: vk::CommandBuffer, polygon_mode: vk::PolygonMode) {
+    if cmd_buffer_handle == vk::CommandBuffer::null() {
+        return;
+    }
+    let Ok(cmd_buffers_guards) = cmd_buffers().lock() else {
+        log::error!("Could not lock devices");
+        return;
+    };
+    let Some(cmd_buffer_data) = cmd_buffers_guards.get(&cmd_buffer_handle) else {
+        log::error!("Could not find command buffer in map");
+        return;
+    };
+    let Ok(devices_guard) = devices().lock() else {
+        log::error!("Could not lock devices");
+        return;
+    };
+    let Some(device_data) = devices_guard.get(&cmd_buffer_data.device_handle) else {
+        log::error!("Could not find device in map");
+        return;
+    };
+    if device_data.supported_features.fill_mode_non_solid == vk::FALSE {
+        return;
+    }
+
+    let Some(ext_device) = device_data.extended_dynamic_state3.as_ref() else {
+        log::error!("VK_EXT_extended_dynamic_state3 was not loaded.");
+        return;
+    };
+    unsafe { (ext_device.cmd_set_polygon_mode_ext)(cmd_buffer_handle, polygon_mode) }
 }
