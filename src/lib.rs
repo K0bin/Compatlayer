@@ -53,18 +53,18 @@ pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
         };
         s
     };
-    if interface.sType != VkNegotiateLayerStructType::LAYER_NEGOTIATE_INTERFACE_STRUCT {
-        log::error!("unexpected negotiate struct type {:?}", interface.sType);
+    if interface.s_type != VkNegotiateLayerStructType::LAYER_NEGOTIATE_INTERFACE_STRUCT {
+        log::error!("unexpected negotiate struct type {:?}", interface.s_type);
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    if interface.loaderLayerInterfaceVersion < 2 {
-        log::error!("loader only supports layer interface v{}; need v2", interface.loaderLayerInterfaceVersion);
+    if interface.loader_layer_interface_version < 2 {
+        log::error!("loader only supports layer interface v{}; need v2", interface.loader_layer_interface_version);
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    interface.loaderLayerInterfaceVersion = CURRENT_LOADER_LAYER_INTERFACE_VERSION;
-    interface.pfnGetInstanceProcAddr = Some(get_instance_proc_addr);
-    interface.pfnGetDeviceProcAddr = Some(get_device_proc_addr);
-    interface.pfnGetPhysicalDeviceProcAddr = None;
+    interface.loader_layer_interface_version = CURRENT_LOADER_LAYER_INTERFACE_VERSION;
+    interface.pfn_get_instance_proc_addr = Some(get_instance_proc_addr);
+    interface.pfn_get_device_proc_addr = Some(get_device_proc_addr);
+    interface.pfn_get_physical_device_proc_addr = None;
     log::info!("negotiated loader/layer interface v{CURRENT_LOADER_LAYER_INTERFACE_VERSION}");
     vk::Result::SUCCESS
 }

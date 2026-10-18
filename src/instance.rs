@@ -89,23 +89,23 @@ pub unsafe extern "system" fn create_instance(
     p_instance: *mut vk::Instance,
 ) -> vk::Result {
     let chain: *const VkLayerInstanceCreateInfo =
-        unsafe { find_in_p_next_chain((*p_create_info).p_next, vk::StructureType::LOADER_INSTANCE_CREATE_INFO,
+        unsafe { find_in_p_next_chain((*p_create_info).p_next,
         |info| info.function == VkLayerFunction::LAYER_LINK_INFO) };
 
     unsafe {
-        if chain.is_null() || (*chain).pLayerInfo.is_null() {
+        if chain.is_null() || (*chain).contents.p_layer_info.is_null() {
             log::error!("no loader link info in the create-info pNext chain");
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         }
     }
 
     // I hate it but Renderdoc seems to do something similar
-    let chain_mut = unsafe { (chain as *mut VkLayerInstanceCreateInfo).as_mut().unwrap() };
+    let chain_mut = chain as *mut VkLayerInstanceCreateInfo;
 
-    let link = unsafe { chain_mut.pLayerInfo.as_ref().unwrap() };
-    let get_proc_addr = link.pfnNextGetInstanceProcAddr;
+    let link = unsafe { (*chain_mut).contents.p_layer_info };
+    let get_proc_addr = unsafe { (*link).pfn_next_get_instance_proc_addr };
     // Advance the chain so the next layer sees its own link.
-    chain_mut.pLayerInfo = (*link).pNext;
+    unsafe { (*chain_mut).contents.p_layer_info = (*link).p_next; }
 
     let next_create = unsafe {
         let Some(next_create) = get_proc_addr(vk::Instance::null(), c"vkCreateInstance".as_ptr()) else {

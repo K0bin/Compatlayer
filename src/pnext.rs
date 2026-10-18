@@ -1,19 +1,18 @@
 use std::ffi::c_void;
 use ash::vk;
+use ash::vk::TaggedStructure;
 
 fn try_bump_alloc_clone_type<'a, 'b : 'a, T: vk::TaggedStructure<'static> + Clone>(bump: &'a bumpalo::Bump, a: &vk::BaseInStructure<'b>) -> Option<&'a mut vk::BaseOutStructure<'b>> {
-    unsafe {
-        if a.s_type != T::STRUCTURE_TYPE {
-            return None;
-        }
-        let ptr = a as *const vk::BaseInStructure;
-        let struct_ref: &T = (ptr as *const T).as_ref_unchecked();
-        let alloced_ref = bump.alloc(struct_ref.clone());
-        let alloced_ptr = alloced_ref as *mut T;
-        let alloced_base_ptr = alloced_ptr as *mut vk::BaseOutStructure<'b>;
-        let alloced_base_ref = &mut (*alloced_base_ptr);
-        Some(alloced_base_ref)
+    if a.s_type != T::STRUCTURE_TYPE {
+        return None;
     }
+    let ptr = a as *const vk::BaseInStructure;
+    let struct_ref: &T = unsafe { (ptr as *const T).as_ref_unchecked() };
+    let alloced_ref = bump.alloc(struct_ref.clone());
+    let alloced_ptr = alloced_ref as *mut T;
+    let alloced_base_ptr = alloced_ptr as *mut vk::BaseOutStructure<'b>;
+    let alloced_base_ref = unsafe { alloced_base_ptr.as_mut_unchecked() };
+    Some(alloced_base_ref)
 }
 
 macro_rules! try_vk_types {
@@ -313,40 +312,39 @@ fn try_bump_alloc_clone<'a, 'b : 'a>(bump: &'a bumpalo::Bump, a: &vk::BaseInStru
     )
 }
 
-pub fn clone_pnext<'a, 'b : 'a>(a: *const c_void, bump: &'a bumpalo::Bump, retain: fn(vk::StructureType) -> bool) -> Option<&'a mut vk::BaseOutStructure<'b>> {
+pub unsafe fn clone_p_next_chain<'a, 'b : 'a>(a: *const c_void, bump: &'a bumpalo::Bump, retain: fn(vk::StructureType) -> bool) -> Option<&'a mut vk::BaseOutStructure<'b>> {
     let typed_ptr = a as *const vk::BaseInStructure<'b>;
     let mut ptr = typed_ptr;
     let mut last: Option<&mut vk::BaseOutStructure<'b>> = None;
     while !ptr.is_null() {
-        unsafe {
-            let ptr_ref = ptr.as_ref_unchecked();
-            if retain((*ptr).s_type) {
-                let new = try_bump_alloc_clone(bump, ptr_ref);
-                if let Some(new) = new {
-                    if let Some(last) = last.as_mut() {
-                        last.p_next = new as *mut vk::BaseOutStructure;
-                    } else {
-                        last = Some(new);
-                    }
+        let ptr_ref = unsafe { ptr.as_ref_unchecked() };
+        if retain(ptr_ref.s_type) {
+            let new = try_bump_alloc_clone(bump, ptr_ref);
+            if let Some(new) = new {
+                if let Some(last) = last.as_mut() {
+                    last.p_next = new as *mut vk::BaseOutStructure;
+                } else {
+                    last = Some(new);
                 }
             }
-            ptr = (*ptr).p_next;
         }
+        ptr = ptr_ref.p_next;
     }
     last
 }
 
-pub unsafe fn find_in_p_next_chain<T>(mut p_next: *const c_void, s_type: vk::StructureType, callback: fn(&T) -> bool) -> *const T {
-    while !p_next.is_null() {
-        let base = unsafe { &*(p_next as *const vk::BaseInStructure) };
-        if base.s_type == s_type {
-            let typed_ptr = p_next as *const T;
-            let typed_ref = unsafe { typed_ptr.as_ref().unwrap() };
+pub unsafe fn find_in_p_next_chain<'a, T : TaggedStructure<'a>>(p_next: *const c_void, callback: fn(&T) -> bool) -> *const T {
+    let mut ptr = p_next as *const vk::BaseInStructure;
+    while !ptr.is_null() {
+        let ptr_ref = unsafe { ptr.as_ref_unchecked() };
+        if ptr_ref.s_type == T::STRUCTURE_TYPE {
+            let typed_ptr = ptr as *const T;
+            let typed_ref = unsafe { typed_ptr.as_ref_unchecked() };
             if callback(typed_ref) {
                 return typed_ptr;
             }
         }
-        p_next = base.p_next as *const c_void;
+        ptr = ptr_ref.p_next;
     }
     std::ptr::null()
 }

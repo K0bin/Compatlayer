@@ -4,6 +4,7 @@
 
 use ash::vk;
 use std::ffi::{c_char, c_void};
+use ash::vk::TaggedStructure;
 
 pub const CURRENT_LOADER_LAYER_INTERFACE_VERSION: u32 = 2;
 
@@ -19,12 +20,12 @@ pub enum VkNegotiateLayerStructType {
 
 #[repr(C)]
 pub struct VkNegotiateLayerInterface {
-    pub sType: VkNegotiateLayerStructType,
-    pub pNext: *mut c_void,
-    pub loaderLayerInterfaceVersion: u32,
-    pub pfnGetInstanceProcAddr: Option<vk::PFN_vkGetInstanceProcAddr>,
-    pub pfnGetDeviceProcAddr: Option<vk::PFN_vkGetDeviceProcAddr>,
-    pub pfnGetPhysicalDeviceProcAddr: PFN_GetPhysicalDeviceProcAddr,
+    pub s_type: VkNegotiateLayerStructType,
+    pub p_next: *mut c_void,
+    pub loader_layer_interface_version: u32,
+    pub pfn_get_instance_proc_addr: Option<vk::PFN_vkGetInstanceProcAddr>,
+    pub pfn_get_device_proc_addr: Option<vk::PFN_vkGetDeviceProcAddr>,
+    pub pfn_get_physical_device_proc_addr: PFN_GetPhysicalDeviceProcAddr,
 }
 
 #[repr(u32)]
@@ -38,30 +39,61 @@ pub enum VkLayerFunction {
 
 #[repr(C)]
 pub struct VkLayerInstanceLink {
-    pub pNext: *mut VkLayerInstanceLink,
-    pub pfnNextGetInstanceProcAddr: vk::PFN_vkGetInstanceProcAddr,
-    pub pfnNextGetPhysicalDeviceProcAddr: PFN_GetPhysicalDeviceProcAddr,
+    pub p_next: *mut VkLayerInstanceLink,
+    pub pfn_next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+    pub pfn_next_get_device_proc_addr: PFN_GetPhysicalDeviceProcAddr,
 }
 
 #[repr(C)]
 pub struct VkLayerInstanceCreateInfo {
-    pub sType: vk::StructureType, // LOADER_INSTANCE_CREATE_INFO
-    pub pNext: *const c_void,
+    pub s_type: vk::StructureType, // LOADER_INSTANCE_CREATE_INFO
+    pub p_next: *const c_void,
     pub function: VkLayerFunction,
-    pub pLayerInfo: *mut VkLayerInstanceLink,
+    pub contents: VkLayerInstanceCreateInfoContents
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct VkLayerDeviceFunctions {
+    pub pfn_layer_create_device: vk::PFN_vkCreateDevice,
+    pub pfn_layer_destroy_device: vk::PFN_vkDestroyDevice,
+}
+
+pub union VkLayerInstanceCreateInfoContents {
+    pub p_layer_info: *mut VkLayerInstanceLink,
+    pub pfn_set_instance_loader_data: vk::PFN_vkGetInstanceProcAddr,
+    pub device_functions: VkLayerDeviceFunctions,
+    pub features: u32
+}
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<VkLayerFunction>() == 4);
+    assert!(offset_of!(VkLayerInstanceCreateInfo, function) == 16);
+    assert!(offset_of!(VkLayerInstanceCreateInfo, contents) == 24);
+    assert!(offset_of!(VkLayerInstanceCreateInfo, contents.p_layer_info) == 24);
+    assert!(size_of::<VkLayerInstanceCreateInfo>() == 40);
+};
+
+unsafe impl TaggedStructure<'static> for VkLayerInstanceCreateInfo {
+    const STRUCTURE_TYPE: vk::StructureType = vk::StructureType::LOADER_INSTANCE_CREATE_INFO;
 }
 
 #[repr(C)]
 pub struct VkLayerDeviceLink {
-    pub pNext: *mut VkLayerDeviceLink,
-    pub pfnNextGetInstanceProcAddr: vk::PFN_vkGetInstanceProcAddr,
-    pub pfnNextGetDeviceProcAddr: vk::PFN_vkGetDeviceProcAddr,
+    pub p_next: *mut VkLayerDeviceLink,
+    pub pfn_next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+    pub pfn_next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
 }
 
 #[repr(C)]
 pub struct VkLayerDeviceCreateInfo {
-    pub sType: vk::StructureType, // LOADER_DEVICE_CREATE_INFO
-    pub pNext: *const c_void,
+    pub s_type: vk::StructureType, // LOADER_DEVICE_CREATE_INFO
+    pub p_next: *const c_void,
     pub function: VkLayerFunction,
-    pub pLayerInfo: *mut VkLayerDeviceLink,
+    pub p_layer_info: *mut VkLayerDeviceLink,
+}
+
+unsafe impl TaggedStructure<'static> for VkLayerDeviceCreateInfo {
+    const STRUCTURE_TYPE: vk::StructureType = vk::StructureType::LOADER_DEVICE_CREATE_INFO;
 }
